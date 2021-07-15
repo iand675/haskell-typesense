@@ -228,6 +228,7 @@ searchQueryToParams :: SearchQuery -> [(ByteString, Maybe ByteString)]
 searchQueryToParams SearchQuery{..} = map (Data.Bifunctor.second Just) $ catMaybes
   [ Just ("q", T.encodeUtf8 $ q)
   , Just ("query_by", T.encodeUtf8 $ T.intercalate "," $ NE.toList queryBy)
+  , (\num -> ("per_page", T.encodeUtf8 $ toQueryParam num)) <$> perPage
   , case queryByWeights of
       [] -> Nothing
       _ -> Just ("query_by_weights", T.encodeUtf8 $ T.intercalate "," $ fmap toQueryParam queryByWeights)
