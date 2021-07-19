@@ -1,6 +1,5 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -9,6 +8,10 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Network.Typesense.Types where
 import Control.Monad.Reader.Class ( MonadReader, asks )
 import Control.Monad.Trans ( MonadIO )
@@ -27,6 +30,45 @@ import qualified Data.List.NonEmpty as NE
 import Network.HTTP.Simple (Query)
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.Bifunctor
+import Data.String (IsString)
+import System.Posix.Types
+import qualified Data.HashMap.Strict as HM
+import Control.Monad.Catch
+import GHC.Generics
+
+-- | JSON Maybe utility
+(.=?) :: ToJSON a => Text -> Maybe a -> [(Text, Value)] -> [(Text, Value)]
+k .=? mv = \xs -> case mv of
+  Nothing -> xs
+  Just v -> (k .= v) : xs
+
+infixl .=?
+
+newtype Id a = Id Text
+  deriving (Show, Eq, Ord, ToJSON, ToJSONKey, FromJSON, FromJSONKey, Functor, Generic, ToHttpApiData, FromHttpApiData)
+
+newtype IdOnlyResponse a = IdOnlyResponse { id :: Id a }
+  deriving (Show, Eq, Ord, Functor, Generic)
+
+instance FromJSON (IdOnlyResponse a) where
+  parseJSON = withObject "IdOnlyResponse" $ \o ->
+    IdOnlyResponse <$> o .: "id"
+
+data Entity a = Entity
+  { id :: Id a
+  , value :: a
+  }
+
+instance ToJSON a => ToJSON (Entity a) where
+  toJSON Entity{..} = case toJSON value of
+    Object o -> Object (HM.insert "id" (toJSON id) o)
+    other -> error (show other ++ " must be an object for Entity instance to work")
+
+instance FromJSON a => FromJSON (Entity a) where
+  parseJSON = withObject "Entity" $ \o ->
+    Entity <$>
+      o .: "id" <*>
+      parseJSON (Object o)
 
 data ScalarType
   = StringField
@@ -84,16 +126,16 @@ data CollectionSchemaField = CollectionSchemaField
   } deriving (Show)
 
 instance ToJSON CollectionSchemaField where
-  toJSON CollectionSchemaField{..} = object (alwaysFields <> maybeFields)
+  toJSON CollectionSchemaField{..} = object 
+    ( "facet" .=? facet $
+      "optional" .=? optional $
+      "index" .=? index $
+      alwaysFields
+    )
     where
       alwaysFields =
         [ "name" .= name
         , "type" .= type_
-        ]
-      maybeFields = catMaybes
-        [ ("facet" .=) <$> facet
-        , ("optional" .=) <$> optional
-        , ("index" .=) <$> index
         ]
 
 instance FromJSON CollectionSchemaField where
@@ -105,31 +147,29 @@ instance FromJSON CollectionSchemaField where
       o .:? "optional" <*>
       o .:? "index"
 
-data CollectionSchema = CollectionSchema
-  { name :: Text
+data CollectionSchema a = CollectionSchema
+  { name :: CollectionName a
   , fields :: [] CollectionSchemaField
   , defaultSortingField :: Maybe Text
   } deriving (Show)
 
-instance ToJSON CollectionSchema where
-  toJSON CollectionSchema{..} = object (alwaysFields <> maybeFields)
+instance ToJSON (CollectionSchema a) where
+  toJSON CollectionSchema{name=CollectionName{collectionName}, ..} = object 
+    ("default_sorting_field" .=? defaultSortingField $ alwaysFields)
     where
       alwaysFields =
-        [ "name" .= name
+        [ "name" .= collectionName
         , "fields" .= fields
         ]
-      maybeFields = catMaybes
-        [ ("default_sorting_field" .=) <$> defaultSortingField
-        ]
 
-data Collection = Collection
-  { name :: Text
+data Collection a = Collection
+  { name :: CollectionName a
   , fields :: [] CollectionSchemaField
   , numDocuments :: Word64
   , defaultSortingField :: Maybe Text
   } deriving (Show)
 
-instance FromJSON Collection where
+instance FromJSON (Collection a) where
   parseJSON = withObject "Collection" $ \o ->
     Collection <$>
       o .: "name" <*>
@@ -139,7 +179,7 @@ instance FromJSON Collection where
 
 newtype CollectionName a = CollectionName
   { collectionName :: Text
-  } deriving (ToHttpApiData)
+  } deriving (Show, Eq, Ord, ToHttpApiData, IsString, ToJSON, FromJSON)
 
 newtype DocumentId a = DocumentId Text
   deriving (Show, Eq, ToJSON, FromJSON)
@@ -166,10 +206,10 @@ class HasTypesenseClient a where
 instance HasTypesenseClient Client where
   getTypesenseClient = Prelude.id
 
-class MonadIO m => MonadTypesense m where
+class (MonadIO m, MonadCatch m) => MonadTypesense m where
   askTypesenseClient :: m Client
 
-instance (HasTypesenseClient c, MonadIO m) => MonadTypesense (ReaderT c m) where
+instance (HasTypesenseClient c, MonadIO m, MonadCatch m) => MonadTypesense (ReaderT c m) where
   askTypesenseClient = asks getTypesenseClient
 
 newtype ApiKey = ApiKey Text
@@ -180,61 +220,167 @@ data QueryBy = QueryBy
   , weight :: Maybe Int
   }
 
+data SortOrder = Ascending | Descending
+
+-- TODO figure out the scoped API Key serialization
+data ParamValue
+  = StringParam !Text
+  | BoolParam !Bool
+  | IntParam !Int
+  deriving (Show)
+
+instance ToHttpApiData ParamValue where
+  toQueryParam = \case
+    StringParam p -> toQueryParam p
+    BoolParam p -> toQueryParam p
+    IntParam p -> toQueryParam p
+
+instance ToJSON ParamValue where
+  toJSON  = \case
+    StringParam p -> toJSON p
+    BoolParam p -> toJSON p
+    IntParam p -> toJSON p
+
+
+newtype QueryParams = QueryParams
+  { queryParams :: HM.HashMap Text ParamValue
+  } deriving (Show, Semigroup, Monoid, ToJSON)
+
 data SearchQuery = SearchQuery
   { q :: Text
-  , queryBy :: NonEmpty Text 
-  -- ^ Fields to query against
-  , queryByWeights :: [Int]
-  -- ^ Weights to allocate each field.
-  , prefix :: [Bool]
-  -- TODO
-  -- , filterBy
-  -- TODO
-  -- , sortBy
-  -- TODO
-  -- , facetBy
-  -- TODO
-  -- , maxFacetValues
-  -- TODO
-  -- , facetQuery
-  -- TODO
-  -- , prioritizeExactMatch
-  , page :: Maybe Int
-  , perPage :: Maybe Int
-  , groupBy :: [Text]
-  , groupLimit :: Maybe Int
-  , includeFields :: [Text]
-  , excludeFields :: [Text]
-  , highlightFields :: [Text]
-  -- TODO more stuff
+  , queryBy :: NonEmpty Text
+  , otherQueryParams :: QueryParams
   }
+
+data SearchQueryParameter a = SearchQueryParameter
+  { paramName :: Text
+  , queryParamSerializer :: a -> ParamValue
+  }
+
+p :: Text -> (a -> ParamValue) -> SearchQueryParameter a
+p = SearchQueryParameter
+
+(.->) :: SearchQueryParameter a -> a -> SearchQuery -> SearchQuery
+paramName .-> val = \q -> q { otherQueryParams = addParam paramName val (otherQueryParams q) }
+
+infixl .->
+
+addParam :: SearchQueryParameter a -> a -> QueryParams -> QueryParams
+addParam SearchQueryParameter{..} p (QueryParams m) = QueryParams $ HM.insert paramName (queryParamSerializer p) m
+
+queryByWeights :: SearchQueryParameter [Int]
+queryByWeights = p "query_by_weights" (StringParam . T.intercalate "," . map toQueryParam)
+
+prefix :: SearchQueryParameter [Bool]
+prefix = p "prefix" (StringParam . T.intercalate "," . map toQueryParam)
+
+filterBy :: SearchQueryParameter Text -- TODO need to support an ADT version
+filterBy = p "filter_by" StringParam
+
+sortBy :: SearchQueryParameter [(Text, SortOrder)]
+sortBy = p "sort_by" (StringParam . T.intercalate "," . map (\(k, v) -> T.concat [k, ":", orderVal v]))
+  where
+    orderVal Ascending = "asc"
+    orderVal Descending = "desc"
+
+facetBy :: SearchQueryParameter [Text]
+facetBy = p "facet_by" (StringParam . T.intercalate "," . map toQueryParam)
+
+maxFacetValues :: SearchQueryParameter Int
+maxFacetValues = p "max_facet_values" IntParam
+
+facetQuery :: SearchQueryParameter (Text, Text {- TODO could potentially support something nicer than text here-})
+facetQuery = p "facet_query" (StringParam . (\(k, v) -> T.concat [k, ":", v]))
+
+prioritizeExactMatch :: SearchQueryParameter Bool
+prioritizeExactMatch = p "prioritize_exact_match" BoolParam
+
+page :: SearchQueryParameter Int
+page = p "page" IntParam
+
+perPage :: SearchQueryParameter Int
+perPage = p "per_page" IntParam
+
+groupBy :: SearchQueryParameter [Text]
+groupBy = p "group_by" (StringParam . T.intercalate ",")
+
+groupLimit :: SearchQueryParameter Int
+groupLimit = p "group_limit" IntParam
+
+includeFields :: SearchQueryParameter [Text]
+includeFields = p "include_fields" (StringParam . T.intercalate ",")
+
+excludeFields :: SearchQueryParameter [Text]
+excludeFields = p "exclude_fields" (StringParam . T.intercalate ",")
+
+highlightFields :: SearchQueryParameter [Text]
+highlightFields = p "highlight_fields" (StringParam . T.intercalate ",")
+
+highlightFullFields :: SearchQueryParameter [Text]
+highlightFullFields = p "highlight_full_fields" (StringParam . T.intercalate ",")
+
+highlightAffixNumTokens :: SearchQueryParameter Int
+highlightAffixNumTokens = p "highlight_affix_num_tokens" IntParam
+
+highlightStartTag :: SearchQueryParameter Text
+highlightStartTag = p "highlight_start_tag" StringParam
+
+highlightEndTag :: SearchQueryParameter Text
+highlightEndTag = p "highlight_end_tag" StringParam
+
+snippetThreshold :: SearchQueryParameter Int
+snippetThreshold = p "snippet_threshold" IntParam
+
+numTypos :: SearchQueryParameter Int
+numTypos = p "num_typos" IntParam
+
+typoTokensThreshold :: SearchQueryParameter Int
+typoTokensThreshold = p "typo_tokens_threshold" IntParam
+
+dropTokensThreshold :: SearchQueryParameter Int
+dropTokensThreshold = p "drop_tokens_threshold" IntParam
+
+pinnedHits :: SearchQueryParameter [(Text, Text)]
+pinnedHits = p "pinned_hits" (StringParam . T.concat . map (\(k, v) -> T.concat [k, ":", v]))
+
+hiddenHits :: SearchQueryParameter [Text]
+hiddenHits = p "hidden_hits" (StringParam . T.intercalate ",")
+
+enableOverrides :: SearchQueryParameter Bool
+enableOverrides = p "enable_overrides" BoolParam
+
+preSegmentedQuery :: SearchQueryParameter Bool
+preSegmentedQuery = p "pre_segmented_query" BoolParam
+
+limitHits :: SearchQueryParameter Int
+limitHits = p "limit_hits" IntParam
 
 query :: Text -> NonEmpty Text -> SearchQuery
 query q queryBy = SearchQuery
   { q = q
   , queryBy = queryBy
-  , queryByWeights = []
-  , prefix = []
-  , page = Nothing
-  , perPage = Nothing
-  , groupBy = []
-  , groupLimit = Nothing
-  , includeFields = []
-  , excludeFields = []
-  , highlightFields = []
+  , otherQueryParams = mempty
   }
 
+searchQueryObject :: SearchQuery -> Object
+searchQueryObject SearchQuery{..} =
+  HM.insert "q" (toJSON q) $
+  HM.insert "query_by" (toJSON q) $
+  HM.map toJSON . queryParams $
+  otherQueryParams
+
 searchQueryToParams :: SearchQuery -> [(ByteString, Maybe ByteString)]
-searchQueryToParams SearchQuery{..} = map (Data.Bifunctor.second Just) $ catMaybes
-  [ Just ("q", T.encodeUtf8 $ q)
-  , Just ("query_by", T.encodeUtf8 $ T.intercalate "," $ NE.toList queryBy)
-  , (\num -> ("per_page", T.encodeUtf8 $ toQueryParam num)) <$> perPage
-  , case queryByWeights of
-      [] -> Nothing
-      _ -> Just ("query_by_weights", T.encodeUtf8 $ T.intercalate "," $ fmap toQueryParam queryByWeights)
-  ]
+searchQueryToParams SearchQuery{..} =
+  [ ("q", Just $ T.encodeUtf8 q)
+  , ("query_by", Just $ T.encodeUtf8 $ T.intercalate "," $ NE.toList queryBy)
+  ] <> extraParams
+  where
+    extraParams = map (\(k, v) -> (T.encodeUtf8 k, Just $ T.encodeUtf8 $ toQueryParam v)) $ HM.toList $ queryParams otherQueryParams
     -- queryByWeightsParam = case mapMaybe $ NonEmpty.toList $ weight queryBy of
     --  [] -> 
+
+instance ToJSON SearchQuery where
+  toJSON = toJSON . searchQueryObject
 
 data Highlight = Highlight
   { field :: Text
@@ -272,3 +418,224 @@ instance FromJSON a => FromJSON (SearchResult a) where
     SearchResult <$>
       o .: "hits" <*>
       o .: "search_time_ms"
+
+data Alias a = Alias
+  { name :: CollectionName a
+  , collectionName :: CollectionName a
+  }
+
+instance FromJSON (Alias a) where
+  parseJSON = withObject "Alias" $ \o ->
+    Alias <$>
+      o .: "name" <*>
+      o .: "collection_name"
+
+newtype Aliases = Aliases
+  { aliases :: [Alias Object]
+  }
+
+instance FromJSON Aliases where
+  parseJSON = withObject "Aliases" $ \o ->
+    Aliases <$>
+      o .: "aliases"
+
+
+data APIKeyAction
+  = DocumentsSearch
+  | DocumentsGet
+  | CollectionsDelete
+  | CollectionsCreate
+  | CollectionsAllOperations
+  | AllOperations
+
+instance ToJSON APIKeyAction where
+  toJSON = String . \case
+    DocumentsSearch -> "documents:search"
+    DocumentsGet -> "documents:get"
+    CollectionsDelete -> "collections:delete"
+    CollectionsCreate -> "collections:create"
+    CollectionsAllOperations -> "collections:*"
+    AllOperations -> "*"
+
+instance FromJSON APIKeyAction where
+  parseJSON = withText "APIKeyAction" $ \case
+    "documents:search" -> pure DocumentsSearch
+    "documents:get" -> pure DocumentsGet
+    "collections:delete" -> pure CollectionsDelete
+    "collections:create" -> pure CollectionsCreate
+    "collections:*" -> pure CollectionsAllOperations
+    "*" -> pure AllOperations
+    str -> fail (show str <> " is not an action that the Haskell typesense library understands. Please file an issue or pull request.")
+
+newtype APIKey = APIKey { apiKey :: ByteString }
+  deriving (Show, Eq, Ord)
+
+instance FromJSON APIKey where
+  parseJSON = withText "APIKey" (pure . APIKey . T.encodeUtf8)
+
+data KeyInfo = KeyInfo
+  { actions :: [APIKeyAction]
+  , collections :: [CollectionName Object]
+  , description :: Maybe Text
+  }
+
+keyInfoToObject :: KeyInfo -> Object
+keyInfoToObject KeyInfo{..} = HM.fromList
+  [ "actions" .= actions
+  , "collections" .= collections
+  , "description" .= description
+  ]
+
+instance FromJSON KeyInfo where
+  parseJSON = withObject "KeyInfo" $ \o ->
+    KeyInfo <$>
+      o .: "actions" <*>
+      o .: "collections" <*>
+      o .:? "description"
+
+data NewAPIKey = NewAPIKey
+  { value :: Maybe Text
+  , expiresAt :: Maybe EpochTime
+  , keyInfo :: KeyInfo
+  }
+
+instance ToJSON NewAPIKey where
+  toJSON NewAPIKey{..} = Object
+    (HM.fromList (catMaybes
+      [ ("value" .=) <$> value
+      , ("expires_at" .=) <$> expiresAt
+      ]) <>
+      keyInfoToObject keyInfo
+    )
+
+
+data CreatedAPIKey = CreatedAPIKey
+  { id :: Text
+  , value :: APIKey
+  , keyInfo :: KeyInfo
+  }
+
+instance FromJSON CreatedAPIKey where
+  parseJSON = withObject "CreatedAPIKey" $ \o ->
+    CreatedAPIKey <$>
+      o .: "id" <*>
+      o .: "value" <*>
+      parseJSON (Object o)
+
+
+data ExistingAPIKey = ExistingAPIKey
+  { id :: Text
+  , valuePrefix :: Text
+  , keyInfo :: KeyInfo
+  }
+
+instance FromJSON ExistingAPIKey where
+  parseJSON = withObject "ExistingAPIKey" $ \o ->
+    ExistingAPIKey <$>
+      o .: "id" <*>
+      o .: "value_prefix" <*>
+      parseJSON (Object o)
+
+newtype DeletedAPIKey = DeletedAPIKey
+  { id :: Text
+  }
+
+instance FromJSON DeletedAPIKey where
+  parseJSON = withObject "DeletedAPIKey" $ \o ->
+    DeletedAPIKey <$>
+      o .: "id"
+
+data SearchQueryForAPIKey =
+  SearchQueryForAPIKey
+    { searchQuery :: SearchQuery
+    , expiresAt :: Maybe EpochTime
+    }
+
+instance ToJSON SearchQueryForAPIKey where
+  toJSON SearchQueryForAPIKey{..} = case expiresAt of
+    Nothing -> toJSON searchQuery
+    Just t -> case toJSON searchQuery of
+      Object o -> Object (HM.insert "expires_at" (toJSON t) o)
+      other -> error ("SearchQuery must serialize to a JSON object: got " <> show other)
+
+newtype ListAPIKeys = ListAPIKeys
+  { keys :: [ExistingAPIKey]
+  }
+
+instance FromJSON ListAPIKeys where
+  parseJSON = withObject "ListAPIKeys" $ \o -> 
+    ListAPIKeys <$> 
+      o .: "keys"
+
+
+
+
+data Synonym = Synonym
+  { synonyms :: [Text]
+  , root :: Maybe Text
+  }
+
+instance ToJSON Synonym where
+  toJSON Synonym{..} = object
+    ( "root" .=? root $
+      ["synonyms" .= synonyms]
+    )
+
+instance FromJSON Synonym where
+  parseJSON = withObject "Synonym" $ \o ->
+    Synonym <$>
+      o .: "synonyms" <*>
+      o .:? "root"
+
+newtype SynonymsList = SynonymsList
+  { synonyms :: [Entity Synonym]
+  }
+
+instance FromJSON SynonymsList where
+  parseJSON = withObject "SynonymsList" $ \o ->
+    SynonymsList <$>
+      o .: "synonyms"
+
+
+newtype CreateSnapshot = CreateSnapshot
+  { snapshotPath :: FilePath
+  }
+
+newtype SlowlogConfig = SlowlogConfig
+  { logSlowRequestsTimeMs :: Int64
+  }
+
+newtype OperationsResponse = OperationsResponse
+  { success :: Bool
+  }
+
+instance FromJSON OperationsResponse where
+  parseJSON = withObject "OperationsResponse" $ \o ->
+    OperationsResponse <$> o .: "success"
+
+newtype ClusterMetrics = ClusterMetrics
+  { metrics :: Object
+  } deriving (Show)
+
+instance FromJSON ClusterMetrics where
+  parseJSON = withObject "ClusterMetrics" $ \o ->
+    ClusterMetrics <$> o .: "metrics"
+
+data APIStats = APIStats
+  { latencyMs :: HM.HashMap Text Double
+  , requestsPerSecond :: HM.HashMap Text Double
+  }
+
+instance FromJSON APIStats where
+  parseJSON = withObject "APIStats" $ \o ->
+    APIStats <$>
+      o .: "latency_ms" <*>
+      o .: "requests_per_second"
+
+newtype Health = Health
+  { status :: Text
+  }
+
+instance FromJSON Health where
+  parseJSON = withObject "Health" $ \o ->
+    Health <$> o .: "status"
