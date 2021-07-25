@@ -1,0 +1,6 @@
+steps:
+- command: |
+    nix-build .
+  agents:
+    os: "nixos"
+

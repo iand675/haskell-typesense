@@ -36,6 +36,7 @@ dependencies:
 - http-conduit
 - http-types
 - text
+- vector
 - mtl
 - unordered-containers
 
