@@ -1,6 +1,7 @@
 steps:
 - command: |
-    nix-build .
+    nix-build -A typesense-client.components.library
+    nix-build -A typesense-client.components.tests
   agents:
     os: "nixos"
 

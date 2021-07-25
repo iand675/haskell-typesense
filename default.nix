@@ -20,13 +20,12 @@ let
     # the haskell.nix functionality itself as an overlay.
     haskellNix.nixpkgsArgs;
 
-  pkgSet = pkgs.haskell-nix.mkStackPkgSet {
-    stack-pkgs = import ./pkgs.nix;
-    pkg-def-extras = [];
-    # modules = [{
-    #   packages.scramble.components.exes.scramble-exe = {
-    #     dontStrip = false;
-    #   };
-    # }];
+in pkgs.haskell-nix.project {
+  # 'cleanGit' cleans a source directory based on the files known by git
+  src = pkgs.haskell-nix.haskellLib.cleanGit {
+    name = "typesense-client";
+    src = ./.;
   };
-in pkgSet.config.hsPkgs
+  # Specify the GHC version to use.
+  # compiler-nix-name = "ghc8102"; # Not required for `stack.yaml` based projects.
+}

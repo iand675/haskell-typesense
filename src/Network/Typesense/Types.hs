@@ -35,6 +35,8 @@ import System.Posix.Types
 import qualified Data.HashMap.Strict as HM
 import Control.Monad.Catch
 import GHC.Generics
+import Data.IORef
+import Data.Vector (Vector)
 
 -- | JSON Maybe utility
 (.=?) :: ToJSON a => Text -> Maybe a -> [(Text, Value)] -> [(Text, Value)]
@@ -167,7 +169,7 @@ data Collection a = Collection
   , fields :: [] CollectionSchemaField
   , numDocuments :: Word64
   , defaultSortingField :: Maybe Text
-  } deriving (Show)
+  } deriving (Show, Functor)
 
 instance FromJSON (Collection a) where
   parseJSON = withObject "Collection" $ \o ->
@@ -179,16 +181,16 @@ instance FromJSON (Collection a) where
 
 newtype CollectionName a = CollectionName
   { collectionName :: Text
-  } deriving (Show, Eq, Ord, ToHttpApiData, IsString, ToJSON, FromJSON)
+  } deriving (Show, Eq, Ord, ToHttpApiData, IsString, ToJSON, ToJSONKey, FromJSON, FromJSONKey, Functor)
 
 newtype DocumentId a = DocumentId Text
-  deriving (Show, Eq, ToJSON, FromJSON)
+  deriving (Show, Eq, ToJSON, ToJSONKey, FromJSON, FromJSONKey, Functor)
 
 -- TODO... 
 data Document a = Document
   { id :: DocumentId a
   , document :: a
-  } deriving (Show)
+  } deriving (Show, Functor)
 
 instance FromJSON a => FromJSON (Document a) where
   parseJSON = withObject "Document" $ \o -> do
@@ -196,8 +198,11 @@ instance FromJSON a => FromJSON (Document a) where
     wrappedValue <- parseJSON (Object o)
     pure $ Document oid wrappedValue
 
-newtype Client = Client
-  { typesenseRequest :: Request
+data Client = Client
+  { typesenseHosts :: Vector Request
+  , lastUsedHostIndex :: IORef Int
+  , connectionTimeoutSeconds :: !Int
+  , apiKey :: APIKey
   }
 
 class HasTypesenseClient a where
@@ -408,7 +413,11 @@ instance FromJSON a => FromJSON (Hit a) where
       o .: "highlights" <*>
       o .: "text_match"
 
-data SearchResult a = SearchResult
+data SearchResultShape 
+  = Regular
+  | Grouped
+
+data SearchResult (shape :: SearchResultShape) a = SearchResult
   { hits :: [Hit a]
   , searchTimeMs :: Int
   } deriving (Show)
